@@ -11,26 +11,22 @@ from src.core.config import settings
 class XUIApi:
     def __init__(self, panel_url, username, password):
         self.base_url = panel_url.rstrip("/")
-        self.username = username
         self.password = password
         self.session = None
         self.cookies = None
         self.logged_in = False
 
     async def _login_panel(self):
-        """ورود به پنل myx"""
+        """ورود به پنل myx با رمز عبور (بدون نام کاربری)"""
         try:
             login_url = f"{self.base_url}/login"
             
             async with aiohttp.ClientSession() as session:
-                # ابتدا صفحه لاگین را دریافت کن
+                # دریافت صفحه لاگین برای گرفتن CSRF token (اگر لازم باشد)
                 async with session.get(login_url) as response:
                     if response.status == 200:
-                        # حالا لاگین را انجام بده
-                        payload = {
-                            "username": self.username,
-                            "password": self.password
-                        }
+                        # لاگین با رمز عبور
+                        payload = {"password": self.password}
                         
                         async with session.post(login_url, data=payload) as login_response:
                             self.cookies = login_response.cookies
@@ -52,7 +48,6 @@ class XUIApi:
         return self.session
 
     async def _make_request(self, method, url, **kwargs):
-        """ارسال درخواست با مدیریت خودکار لاگین"""
         try:
             if not self.logged_in:
                 await self._login_panel()
@@ -97,7 +92,6 @@ class XUIApi:
         try:
             # در پنل myx، اینباند پیش‌فرض همیشه ID=1 دارد
             if inbound_id == 1:
-                # یک اینباند مجازی بساز
                 return {
                     "id": 1,
                     "port": 443,
@@ -106,7 +100,7 @@ class XUIApi:
                         "network": "ws",
                         "security": "tls",
                         "wsSettings": {
-                            "path": "/"
+                            "path": "/b6e0f80e8273"
                         }
                     }),
                     "settings": json.dumps({"clients": []})
@@ -150,7 +144,6 @@ class XUIApi:
 
     async def get_vless_uri(self, inbound_id, client_uuid, remark, inbound_data=None):
         """ساخت لینک کانفیگ برای پنل myx"""
-        # تنظیمات پنل myx
         server_address = settings.PUBLIC_HOST.replace("https://", "").replace("http://", "")
         port = 443
         path = "/b6e0f80e8273"  # مسیر پیش‌فرض پنل myx
@@ -235,19 +228,9 @@ class XUIApi:
                     })
                 return users
             
-            # اگر API کار نکرد، از روش جایگزین استفاده کن
-            return await self._get_users_from_web()
+            return []
         except Exception as e:
             logging.error(f"Error getting users: {e}")
-            return []
-
-    async def _get_users_from_web(self):
-        """دریافت لیست کاربران از صفحه وب پنل myx"""
-        try:
-            # این روش به HTML scraping نیاز دارد
-            # فعلاً لیست خالی برگردان
-            return []
-        except:
             return []
 
     async def delete_user(self, user_id):
