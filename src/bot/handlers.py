@@ -1,318 +1,293 @@
-import asyncio
-import logging
 import re
-
-from aiogram import F, Router
-from aiogram.filters import (
-    Command,
-    CommandObject,
-    CommandStart,
-    StateFilter,
-)
+from datetime import datetime, timedelta
+from aiogram import Router, F, types
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import any_state
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
-from aiogram.utils.markdown import hcode
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 from src.api.xui_api import XUIApi
-from src.bot.callbacks import ProfileCallback
-from src.bot.keyboards import get_profiles_markup
-from src.bot.states import ProfileCreation
 from src.core.config import settings
 
 router = Router()
+api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
 
+# ========== تعریف وضعیت‌های مختلف برای عملیات ==========
+class UserCreation(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_limit = State()
+    waiting_for_days = State()
 
-def parse_args_with_limits(args: list[str]) -> dict:
-    remark_parts = []
-    limit = 0
-    days = 0
-    for part in args:
-        if match := re.match(r"limit=(\d+)", part, re.IGNORECASE):
-            limit = int(match.group(1))
-        elif match := re.match(r"days=(\d+)", part, re.IGNORECASE):
-            days = int(match.group(1))
-        else:
-            remark_parts.append(part)
-    return {"remark": " ".join(remark_parts), "limit": limit, "days": days}
+class UserDeletion(StatesGroup):
+    waiting_for_user_id = State()
 
+# ========== منوی اصلی (دکمه‌های شیشه‌ای در پایین صفحه) ==========
+def get_main_menu():
+    """ساخت منوی اصلی با دکمه‌های شیشه‌ای"""
+    keyboard = [
+        [KeyboardButton(text="➕ ساخت کانفیگ جدید")],
+        [KeyboardButton(text="📋 لیست کاربران")],
+        [KeyboardButton(text="❌ حذف کاربر")],
+        [KeyboardButton(text="📊 آمار پنل"), KeyboardButton(text="ℹ️ راهنما")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
-async def create_proxy_profile(
-    message: Message,
-    host: str,
-    port: str,
-    user: str,
-    password: str,
-    remark: str,
-    limit: int,
-    days: int,
-):
-    api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
-    api.login()
-
-    sanitized_remark = remark.lower().replace(" ", "-").replace(":", "-")
-    if api.is_profile_exists(sanitized_remark, settings.VLESS_INBOUND_ID):
-        await message.answer(f"❌ <b>Профиль с именем '{remark}' уже существует.</b>")
-        return
-
-    msg = await message.answer("Имя свободно. Начинаю работу... ⏳")
-    try:
-        await msg.edit_text("Шаг 1/5: Получение данных инбаунда...")
-        inbound_info = api.get_inbound(settings.VLESS_INBOUND_ID)
-
-        outbound_tag = f"out-{sanitized_remark[:20]}"
-        await msg.edit_text(f"Шаг 2/5: Добавление аутбаунда (тег: {outbound_tag})...")
-        api.add_outbound(outbound_tag, host, port, user, password)
-
-        client_remark = f"user-{sanitized_remark[:20]}"
-        await msg.edit_text(
-            f"Шаг 3/5: Создание клиента (примечание: {client_remark})..."
-        )
-        new_uuid = api.add_client_to_inbound(
-            settings.VLESS_INBOUND_ID, client_remark, total_gb=limit, expiry_days=days
-        )
-
-        await msg.edit_text("Шаг 4/5: Создание правила маршрутизации...")
-        api.add_routing_rule(client_remark, outbound_tag, settings.VLESS_INBOUND_ID)
-
-        await msg.edit_text("Шаг 5/5: Перезапуск Xray и генерация ссылки...")
-        api.restart_xray()
-        await asyncio.sleep(3)
-
-        vless_uri = api.get_vless_uri(
-            settings.VLESS_INBOUND_ID, new_uuid, remark, inbound_data=inbound_info
-        )
-
-        await msg.delete()
-        await message.answer(
-            f"✅ <b>Готово! Профиль '{remark}' создан.</b>\n\n"
-            f"Лимиты: {limit or '∞'} ГБ, {days or '∞'} дней.\n\n"
-            "Ссылка для подключения (нажмите, чтобы скопировать):\n"
-            f"{hcode(vless_uri)}"
-        )
-    except Exception as e:
-        logging.error(f"Ошибка при создании прокси-профиля: {e}", exc_info=True)
-        await msg.edit_text(f"❌ <b>Что-то пошло не так.</b>\n\n<b>Ошибка:</b> {e}")
-
-
-async def create_direct_vless_profile(
-    message: Message, remark: str, limit: int, days: int
-):
-    api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
-    api.login()
-
-    sanitized_remark = remark.lower().replace(" ", "-").replace(":", "-")
-    if api.is_profile_exists(sanitized_remark, settings.VLESS_INBOUND_ID):
-        await message.answer(f"❌ <b>Профиль с именем '{remark}' уже существует.</b>")
-        return
-
-    msg = await message.answer("Имя свободно. Начинаю работу... ⏳")
-    try:
-        await msg.edit_text("Шаг 1/4: Получение данных инбаунда...")
-        inbound_info = api.get_inbound(settings.VLESS_INBOUND_ID)
-
-        client_remark = f"user-{sanitized_remark[:20]}"
-        await msg.edit_text(
-            f"Шаг 2/4: Создание клиента (примечание: {client_remark})..."
-        )
-        new_uuid = api.add_client_to_inbound(
-            settings.VLESS_INBOUND_ID,
-            client_remark,
-            total_gb=limit,
-            expiry_days=days,
-            flow="xtls-rprx-vision-udp443",
-        )
-
-        await msg.edit_text("Шаг 3/4: Создание правила маршрутизации (на 'direct')...")
-        api.add_routing_rule(client_remark, "direct", settings.VLESS_INBOUND_ID)
-
-        await msg.edit_text("Шаг 4/4: Перезапуск Xray и генерация ссылки...")
-        api.restart_xray()
-        await asyncio.sleep(3)
-
-        vless_uri = api.get_vless_uri(
-            settings.VLESS_INBOUND_ID, new_uuid, remark, inbound_data=inbound_info
-        )
-
-        await msg.delete()
-        await message.answer(
-            f"✅ <b>Готово! 'Чистый' VLESS профиль '{remark}' создан.</b>\n\n"
-            f"Лимиты: {limit or '∞'} ГБ, {days or '∞'} дней.\n\n"
-            "Ссылка для подключения (нажмите, чтобы скопировать):\n"
-            f"{hcode(vless_uri)}"
-        )
-    except Exception as e:
-        logging.error(f"Ошибка при создании VLESS-профиля: {e}", exc_info=True)
-        await msg.edit_text(f"❌ <b>Что-то пошло не так.</b>\n\n<b>Ошибка:</b> {e}")
-
-
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "👋 Привет! Я бот для управления прокси-профилями.\n\n"
-        "▪️ /new <code>host:port:user:pass Название [limit=ГБ] [days=ДНЕЙ]</code> - создать профиль через прокси\n"
-        "▪️ /vless <code>Название [limit=ГБ] [days=ДНЕЙ]</code> - создать 'чистый' VLESS профиль\n"
-        "▪️ /list - показать все профили\n"
-        "▪️ /cancel - отменить текущее действие"
-    )
-
-
-@router.message(Command("cancel"), StateFilter(any_state))
-async def cmd_cancel(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer("Нет активных действий для отмены.")
-        return
-
-    logging.info("Cancelling state %r", current_state)
-    await state.clear()
-    await message.answer("Действие отменено.")
-
-
-@router.message(Command("new"))
-async def cmd_new(message: Message, state: FSMContext, command: CommandObject):
-    await state.clear()
-    if not command.args:
-        await message.answer(
-            "Введите данные нового прокси и его название.\n\n"
-            "<b>Формат:</b> <code>host:port:user:pass Название [limit=ГБ] [days=ДНЕЙ]</code>\n\n"
-            "<b>Пример:</b>\n<code>proxy.example.com:1234:john:secret123 Прокси1 limit=50 days=30</code>\n\n"
-            "Для отмены введите /cancel"
-        )
-        await state.set_state(ProfileCreation.waiting_for_proxy_details)
-        return
-    try:
-        parts = command.args.split()
-        if len(parts) < 2:
-            raise ValueError(
-                "Неверный формат. Нужно указать и данные прокси, и название."
+# ========== منوی اینلاین برای لیست کاربران ==========
+def get_users_inline_menu(users):
+    """ساخت منوی اینلاین برای لیست کاربران با دکمه حذف"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    for user in users:
+        keyboard.add(
+            InlineKeyboardButton(
+                text=f"🗑️ حذف {user.get('name', 'بی‌نام')}",
+                callback_data=f"delete_user_{user.get('id')}"
             )
-        proxy_data_str = parts[0]
-        parsed_args = parse_args_with_limits(parts[1:])
-        remark = parsed_args["remark"]
-        if not remark:
-            raise ValueError("Необходимо указать название профиля.")
-        host, port, user, password = proxy_data_str.split(":")
-        await create_proxy_profile(
-            message,
-            host,
-            port,
-            user,
-            password,
-            remark,
-            parsed_args["limit"],
-            parsed_args["days"],
         )
-    except (ValueError, IndexError) as e:
-        await message.answer(
-            f"❌ <b>Ошибка в формате данных:</b> {e}\n\nИспользуйте формат: <code>/new host:port:user:pass Название [limit=ГБ] [days=ДНЕЙ]</code>"
-        )
+    keyboard.add(InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_to_menu"))
+    return keyboard
 
+# ========== دستور /start ==========
+@router.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "👋 به ربات مدیریت پنل خوش آمدید!\n\n"
+        "از طریق دکمه‌های زیر می‌توانید تمام عملیات مدیریتی را انجام دهید:",
+        reply_markup=get_main_menu()
+    )
 
-@router.message(
-    ProfileCreation.waiting_for_proxy_details, F.text, ~F.text.startswith("/")
-)
-async def process_proxy_details_fsm(message: Message, state: FSMContext):
-    command = CommandObject(prefix="/", command="new", args=message.text)
-    await cmd_new(message, state, command)
+# ========== دستور /help ==========
+@router.message(Command("help"))
+async def cmd_help(message: types.Message):
+    help_text = (
+        "📖 **راهنمای کامل ربات**\n\n"
+        "✅ **ساخت کانفیگ جدید:**\n"
+        "روی دکمه «➕ ساخت کانفیگ جدید» کلیک کنید و سپس مراحل را دنبال کنید.\n\n"
+        "✅ **مشاهده لیست کاربران:**\n"
+        "روی دکمه «📋 لیست کاربران» کلیک کنید.\n\n"
+        "✅ **حذف کاربر:**\n"
+        "روی دکمه «❌ حذف کاربر» کلیک کنید و شناسه کاربر را وارد کنید.\n\n"
+        "✅ **آمار پنل:**\n"
+        "برای مشاهده وضعیت کلی پنل، روی دکمه «📊 آمار پنل» کلیک کنید."
+    )
+    await message.answer(help_text, parse_mode="Markdown")
 
+# ========== ساخت کانفیگ جدید (گام اول: دریافت نام) ==========
+@router.message(F.text == "➕ ساخت کانفیگ جدید")
+async def start_vless_creation(message: types.Message, state: FSMContext):
+    await state.set_state(UserCreation.waiting_for_name)
+    await message.answer(
+        "📝 **لطفاً نام کاربر را وارد کنید:**\n\n"
+        "نام باید فقط شامل حروف، اعداد و خط تیره باشد.",
+        parse_mode="Markdown"
+    )
 
-@router.message(Command("vless"))
-async def cmd_vless(message: Message, command: CommandObject, state: FSMContext):
-    await state.clear()
-    if not command.args:
-        await message.answer(
-            "Введите название для обычного VLESS профиля.\n\n"
-            "<b>Формат:</b> <code>/vless Название [limit=ГБ] [days=ДНЕЙ]</code>\n\n"
-            "<b>Пример:</b>\n<code>/vless Мой телефон limit=10</code>"
-        )
+@router.message(UserCreation.waiting_for_name, F.text)
+async def process_vless_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    if not re.match(r'^[a-zA-Z0-9\-_]+$', name):
+        await message.answer("❌ نام نامعتبر است! فقط از حروف، اعداد و خط تیره استفاده کنید.")
         return
-    parsed_args = parse_args_with_limits(command.args.split())
-    remark = parsed_args["remark"]
-    if not remark:
-        await message.answer("❌ Необходимо указать название профиля.")
-        return
-    await create_direct_vless_profile(
-        message, remark, parsed_args["limit"], parsed_args["days"]
+    await state.update_data(name=name)
+    await state.set_state(UserCreation.waiting_for_limit)
+    await message.answer(
+        "📊 **محدودیت حجم (به گیگابایت) را وارد کنید:**\n\n"
+        "مثال: `50` (برای ۵۰ گیگ) یا `0` (برای بدون محدودیت)",
+        parse_mode="Markdown"
     )
 
-
-@router.message(Command("list"))
-async def cmd_list(message: Message, state: FSMContext):
-    await state.clear()
-    text, markup = await get_profiles_markup()
-    await message.answer(text, reply_markup=markup)
-
-
-@router.callback_query(ProfileCallback.filter(F.action == "list"))
-async def cq_list_page(query: CallbackQuery, callback_data: ProfileCallback):
-    text, markup = await get_profiles_markup(page=callback_data.page)
-    await query.message.edit_text(text, reply_markup=markup)
-    await query.answer()
-
-
-@router.callback_query(ProfileCallback.filter(F.action == "confirm_delete"))
-async def cq_confirm_delete(query: CallbackQuery, callback_data: ProfileCallback):
-    remark = callback_data.profile_id.replace("-", " ")
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="‼️ Да, удалить",
-                    callback_data=ProfileCallback(
-                        action="execute_delete", profile_id=callback_data.profile_id
-                    ).pack(),
-                ),
-                InlineKeyboardButton(
-                    text="Отмена",
-                    callback_data=ProfileCallback(
-                        action="list", page=callback_data.page
-                    ).pack(),
-                ),
-            ]
-        ]
-    )
-    await query.message.edit_text(
-        f"Вы уверены, что хотите удалить профиль <b>{remark.capitalize()}</b>?\n\nЭто действие необратимо.",
-        reply_markup=markup,
-    )
-    await query.answer()
-
-
-@router.callback_query(ProfileCallback.filter(F.action == "execute_delete"))
-async def cq_execute_delete(query: CallbackQuery, callback_data: ProfileCallback):
-    await query.message.edit_text("Удаляю профиль... ⏳")
+# ========== ساخت کانفیگ جدید (گام دوم: دریافت حجم) ==========
+@router.message(UserCreation.waiting_for_limit, F.text)
+async def process_vless_limit(message: types.Message, state: FSMContext):
     try:
-        api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
-        api.login()
+        limit = int(message.text)
+        if limit < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ لطفاً یک عدد معتبر (۰ یا بیشتر) وارد کنید.")
+        return
+    await state.update_data(limit=limit)
+    await state.set_state(UserCreation.waiting_for_days)
+    await message.answer(
+        "📅 **مدت زمان (به روز) را وارد کنید:**\n\n"
+        "مثال: `30` (برای ۳۰ روز) یا `0` (برای بدون محدودیت زمانی)",
+        parse_mode="Markdown"
+    )
 
-        profiles = api.get_profiles(settings.VLESS_INBOUND_ID)
-        profile_to_delete = next(
-            (p for p in profiles if p["profile_id"] == callback_data.profile_id), None
+# ========== ساخت کانفیگ جدید (گام سوم: دریافت مدت و ایجاد نهایی) ==========
+@router.message(UserCreation.waiting_for_days, F.text)
+async def process_vless_days(message: types.Message, state: FSMContext):
+    try:
+        days = int(message.text)
+        if days < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ لطفاً یک عدد معتبر (۰ یا بیشتر) وارد کنید.")
+        return
+    
+    data = await state.get_data()
+    name = data['name']
+    limit_gb = data['limit']
+    
+    # محاسبه تاریخ انقضا
+    expiry_date = None
+    if days > 0:
+        expiry_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+    
+    # ارسال به پنل برای ساخت
+    try:
+        result = await api.create_vless_user(
+            name=name,
+            limit_gb=limit_gb,
+            expiry_date=expiry_date
         )
-
-        if not profile_to_delete:
-            raise ValueError("Профиль для удаления не найден.")
-
-        api.delete_profile(
-            profile_to_delete["client_remark"],
-            profile_to_delete["outbound_tag"],
-            settings.VLESS_INBOUND_ID,
-        )
-        api.restart_xray()
-
-        remark = callback_data.profile_id.replace("-", " ")
-        await query.answer(f"Профиль {remark.capitalize()} удален!", show_alert=True)
-
-        text, markup = await get_profiles_markup(page=0)
-        await query.message.edit_text(text, reply_markup=markup)
+        if result.get('success'):
+            config_link = result.get('link', 'لینک تولید نشد')
+            await message.answer(
+                f"✅ **کانفیگ با موفقیت ساخته شد!**\n\n"
+                f"👤 **نام:** {name}\n"
+                f"📊 **حجم:** {limit_gb} گیگ\n"
+                f"📅 **انقضا:** {expiry_date if expiry_date else 'نامحدود'}\n\n"
+                f"🔗 **لینک کانفیگ:**\n`{config_link}`",
+                parse_mode="Markdown",
+                reply_markup=get_main_menu()
+            )
+        else:
+            await message.answer(
+                f"❌ **خطا در ساخت کانفیگ:**\n{result.get('message', 'خطای ناشناخته')}",
+                reply_markup=get_main_menu()
+            )
     except Exception as e:
-        logging.error(f"Ошибка при удалении: {e}", exc_info=True)
-        await query.message.edit_text(f"❌ Не удалось удалить профиль.\nОшибка: {e}")
-        await query.answer("Ошибка при удалении", show_alert=True)
+        await message.answer(
+            f"❌ **خطا در ارتباط با پنل:**\n{str(e)}",
+            reply_markup=get_main_menu()
+        )
+    
+    await state.clear()
+
+# ========== لیست کاربران ==========
+@router.message(F.text == "📋 لیست کاربران")
+async def cmd_list(message: types.Message):
+    try:
+        users = await api.get_users()
+        if not users:
+            await message.answer("❌ هیچ کاربری یافت نشد.", reply_markup=get_main_menu())
+            return
+        
+        # نمایش لیست به صورت متن
+        user_list = "📋 **لیست کاربران:**\n\n"
+        for i, user in enumerate(users, 1):
+            user_list += (
+                f"{i}. 👤 **{user.get('name', 'بی‌نام')}**\n"
+                f"   🆔 شناسه: `{user.get('id')}`\n"
+                f"   📊 حجم: {user.get('limit', 'نامحدود')} گیگ\n"
+                f"   📅 انقضا: {user.get('expiry', 'نامحدود')}\n\n"
+            )
+        
+        # ارسال لیست به همراه منوی اینلاین برای حذف سریع
+        await message.answer(
+            user_list,
+            parse_mode="Markdown",
+            reply_markup=get_users_inline_menu(users)
+        )
+    except Exception as e:
+        await message.answer(
+            f"❌ **خطا در دریافت لیست کاربران:**\n{str(e)}",
+            reply_markup=get_main_menu()
+        )
+
+# ========== حذف کاربر از طریق دکمه اینلاین ==========
+@router.callback_query(F.data.startswith("delete_user_"))
+async def delete_user_from_button(callback: types.CallbackQuery):
+    user_id = callback.data.split("_")[2]
+    try:
+        result = await api.delete_user(user_id)
+        if result.get('success'):
+            await callback.message.edit_text(
+                f"✅ کاربر با شناسه `{user_id}` با موفقیت حذف شد.",
+                parse_mode="Markdown"
+            )
+        else:
+            await callback.message.edit_text(
+                f"❌ **خطا در حذف کاربر:**\n{result.get('message', 'خطای ناشناخته')}",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ **خطا در ارتباط با پنل:**\n{str(e)}"
+        )
+    await callback.answer()
+    await callback.message.answer("🔙 به منوی اصلی بازگشتید.", reply_markup=get_main_menu())
+
+# ========== حذف کاربر (دستور متنی) ==========
+@router.message(F.text == "❌ حذف کاربر")
+async def start_delete_user(message: types.Message, state: FSMContext):
+    await state.set_state(UserDeletion.waiting_for_user_id)
+    await message.answer(
+        "🗑️ **شناسه کاربر مورد نظر را وارد کنید:**\n\n"
+        "شناسه را می‌توانید از لیست کاربران (دکمه 📋 لیست کاربران) مشاهده کنید.",
+        parse_mode="Markdown"
+    )
+
+@router.message(UserDeletion.waiting_for_user_id, F.text)
+async def process_delete_user(message: types.Message, state: FSMContext):
+    user_id = message.text.strip()
+    try:
+        result = await api.delete_user(user_id)
+        if result.get('success'):
+            await message.answer(
+                f"✅ کاربر با شناسه `{user_id}` با موفقیت حذف شد.",
+                parse_mode="Markdown",
+                reply_markup=get_main_menu()
+            )
+        else:
+            await message.answer(
+                f"❌ **خطا در حذف کاربر:**\n{result.get('message', 'خطای ناشناخته')}",
+                reply_markup=get_main_menu()
+            )
+    except Exception as e:
+        await message.answer(
+            f"❌ **خطا در ارتباط با پنل:**\n{str(e)}",
+            reply_markup=get_main_menu()
+        )
+    await state.clear()
+
+# ========== آمار پنل ==========
+@router.message(F.text == "📊 آمار پنل")
+async def cmd_stats(message: types.Message):
+    try:
+        stats = await api.get_stats()  # تابع دریافت آمار را باید در xui_api.py بسازید
+        stats_text = (
+            "📊 **آمار کلی پنل**\n\n"
+            f"👥 **تعداد کل کاربران:** {stats.get('total_users', 0)}\n"
+            f"📈 **ترافیک مصرفی امروز:** {stats.get('today_traffic', 0)} GB\n"
+            f"📊 **ترافیک کل مصرفی:** {stats.get('total_traffic', 0)} GB\n"
+            f"💾 **وضعیت سرور:** {stats.get('server_status', 'نامشخص')}"
+        )
+        await message.answer(stats_text, parse_mode="Markdown", reply_markup=get_main_menu())
+    except Exception as e:
+        await message.answer(
+            f"❌ **خطا در دریافت آمار:**\n{str(e)}",
+            reply_markup=get_main_menu()
+        )
+
+# ========== بازگشت به منو از دکمه اینلاین ==========
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.message.answer("🔙 به منوی اصلی بازگشتید.", reply_markup=get_main_menu())
+    await callback.answer()
+
+# ========== لغو عملیات ==========
+@router.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ عملیات لغو شد.", reply_markup=get_main_menu())
+
+# ========== پاسخ به پیام‌های ناشناخته ==========
+@router.message()
+async def handle_unknown(message: types.Message):
+    await message.answer(
+        "❓ دستور یا پیام ناشناخته.\n"
+        "لطفاً از دکمه‌های منو استفاده کنید یا /help را بزنید.",
+        reply_markup=get_main_menu()
+    )
