@@ -10,9 +10,11 @@ from src.api.xui_api import XUIApi
 from src.core.config import settings
 
 router = Router()
-api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
 
-# ========== تعریف وضعیت‌های مختلف برای عملیات ==========
+# ========== تعریف وضعیت‌ها ==========
+class LoginState(StatesGroup):
+    waiting_for_password = State()
+
 class UserCreation(StatesGroup):
     waiting_for_name = State()
     waiting_for_limit = State()
@@ -21,24 +23,32 @@ class UserCreation(StatesGroup):
 class UserDeletion(StatesGroup):
     waiting_for_user_id = State()
 
-# ========== منوی اصلی (دکمه‌های شیشه‌ای در پایین صفحه) ==========
+# ========== ذخیره وضعیت لاگین کاربران ==========
+user_sessions = {}  # {user_id: logged_in}
+
+# ========== منوهای مختلف ==========
+def get_login_menu():
+    """منوی لاگین"""
+    keyboard = [
+        [KeyboardButton(text="🔑 ورود به پنل")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
 def get_main_menu():
-    """ساخت منوی اصلی با دکمه‌های شیشه‌ای"""
+    """منوی اصلی بعد از لاگین"""
     keyboard = [
         [KeyboardButton(text="➕ ساخت کانفیگ جدید")],
         [KeyboardButton(text="📋 لیست کاربران")],
         [KeyboardButton(text="❌ حذف کاربر")],
-        [KeyboardButton(text="📊 آمار پنل"), KeyboardButton(text="🔐 ورود به پنل")],
-        [KeyboardButton(text="ℹ️ راهنما")]
+        [KeyboardButton(text="📊 آمار پنل")],
+        [KeyboardButton(text="🔐 خروج از پنل")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
-# ========== منوی اینلاین برای لیست کاربران ==========
 def get_users_inline_menu(users):
-    """ساخت منوی اینلاین برای لیست کاربران با دکمه حذف"""
+    """منوی اینلاین برای لیست کاربران"""
     keyboard = InlineKeyboardMarkup(row_width=1)
     for user in users:
-        # اطمینان از وجود name و id
         user_name = user.get('name', 'بی‌نام')
         user_id = user.get('id')
         if user_id:
@@ -54,15 +64,84 @@ def get_users_inline_menu(users):
 # ========== دستور /start ==========
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    if user_sessions.get(user_id):
+        await message.answer(
+            "👋 به ربات مدیریت پنل خوش آمدید!\n\n"
+            "شما قبلاً وارد شده‌اید. از منوی زیر استفاده کنید:",
+            reply_markup=get_main_menu()
+        )
+    else:
+        await message.answer(
+            "👋 به ربات مدیریت پنل خوش آمدید!\n\n"
+            "لطفاً برای دسترسی به پنل، روی دکمه زیر کلیک کنید:",
+            reply_markup=get_login_menu()
+        )
+
+# ========== ورود به پنل ==========
+@router.message(F.text == "🔑 ورود به پنل")
+async def start_login(message: types.Message, state: FSMContext):
+    await state.set_state(LoginState.waiting_for_password)
     await message.answer(
-        "👋 به ربات مدیریت پنل خوش آمدید!\n\n"
-        "از طریق دکمه‌های زیر می‌توانید تمام عملیات مدیریتی را انجام دهید:",
-        reply_markup=get_main_menu()
+        "🔑 **لطفاً رمز عبور پنل را وارد کنید:**\n\n"
+        "⚠️ این پنل فقط با رمز عبور کار می‌کند.",
+        parse_mode="Markdown"
     )
+
+@router.message(LoginState.waiting_for_password, F.text)
+async def process_login(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    entered_password = message.text.strip()
+    
+    # بررسی رمز عبور
+    if entered_password == settings.PANEL_PASSWORD:
+        user_sessions[user_id] = True
+        await message.answer(
+            "✅ **ورود موفق!**\n\n"
+            "شما اکنون به پنل دسترسی دارید. از منوی زیر استفاده کنید:",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu()
+        )
+    else:
+        await message.answer(
+            "❌ **رمز عبور اشتباه است!**\n\n"
+            "لطفاً دوباره تلاش کنید یا /cancel را بزنید.",
+            parse_mode="Markdown"
+        )
+    await state.clear()
+
+# ========== خروج از پنل ==========
+@router.message(F.text == "🔐 خروج از پنل")
+async def cmd_logout(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+    await message.answer(
+        "👋 **شما از پنل خارج شدید.**\n\n"
+        "برای ورود مجدد، روی دکمه «🔑 ورود به پنل» کلیک کنید.",
+        parse_mode="Markdown",
+        reply_markup=get_login_menu()
+    )
+
+# ========== بررسی لاگین بودن کاربر ==========
+async def is_logged_in(message: types.Message):
+    user_id = message.from_user.id
+    if not user_sessions.get(user_id):
+        await message.answer(
+            "❌ **شما وارد نشده‌اید!**\n\n"
+            "لطفاً ابتدا روی دکمه «🔑 ورود به پنل» کلیک کرده و رمز عبور را وارد کنید.",
+            parse_mode="Markdown",
+            reply_markup=get_login_menu()
+        )
+        return False
+    return True
 
 # ========== دستور /help ==========
 @router.message(Command("help"))
 async def cmd_help(message: types.Message):
+    if not await is_logged_in(message):
+        return
+    
     help_text = (
         "📖 **راهنمای کامل ربات**\n\n"
         "✅ **ساخت کانفیگ جدید:**\n"
@@ -73,41 +152,29 @@ async def cmd_help(message: types.Message):
         "روی دکمه «❌ حذف کاربر» کلیک کنید و شناسه کاربر را وارد کنید.\n\n"
         "✅ **آمار پنل:**\n"
         "برای مشاهده وضعیت کلی پنل، روی دکمه «📊 آمار پنل» کلیک کنید.\n\n"
-        "✅ **ورود به پنل:**\n"
-        "روی دکمه «🔐 ورود به پنل» کلیک کنید تا آدرس و رمز عبور پنل را دریافت کنید."
+        "✅ **خروج از پنل:**\n"
+        "روی دکمه «🔐 خروج از پنل» کلیک کنید."
     )
     await message.answer(help_text, parse_mode="Markdown", reply_markup=get_main_menu())
 
-# ========== دکمه ورود به پنل ==========
-@router.message(F.text == "🔐 ورود به پنل")
-async def cmd_panel_login(message: types.Message):
-    """ارسال لینک و رمز عبور پنل به کاربر"""
-    panel_url = settings.PANEL_URL
-    password = settings.PANEL_PASSWORD
-    
-    await message.answer(
-        f"🔐 **ورود به پنل مدیریت**\n\n"
-        f"🌐 **آدرس پنل:**\n{panel_url}\n\n"
-        f"🔑 **رمز عبور:**\n`{password}`\n\n"
-        f"💡 برای ورود، روی لینک کلیک کرده و رمز عبور را وارد کنید.\n"
-        f"⚠️ **توجه:** این پنل فقط با رمز عبور کار می‌کند و نیازی به نام کاربری ندارد.",
-        parse_mode="Markdown",
-        reply_markup=get_main_menu()
-    )
-
-# ========== ساخت کانفیگ جدید (گام اول: دریافت نام) ==========
+# ========== ساخت کانفیگ جدید ==========
 @router.message(F.text == "➕ ساخت کانفیگ جدید")
 async def start_vless_creation(message: types.Message, state: FSMContext):
+    if not await is_logged_in(message):
+        return
     await state.set_state(UserCreation.waiting_for_name)
     await message.answer(
         "📝 **لطفاً نام کاربر را وارد کنید:**\n\n"
         "نام باید فقط شامل حروف، اعداد و خط تیره باشد.",
-        parse_mode="Markdown",
-        reply_markup=get_main_menu()
+        parse_mode="Markdown"
     )
 
 @router.message(UserCreation.waiting_for_name, F.text)
 async def process_vless_name(message: types.Message, state: FSMContext):
+    if not await is_logged_in(message):
+        await state.clear()
+        return
+    
     name = message.text.strip()
     if not re.match(r'^[a-zA-Z0-9\-_]+$', name):
         await message.answer("❌ نام نامعتبر است! فقط از حروف، اعداد و خط تیره استفاده کنید.")
@@ -120,9 +187,12 @@ async def process_vless_name(message: types.Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# ========== ساخت کانفیگ جدید (گام دوم: دریافت حجم) ==========
 @router.message(UserCreation.waiting_for_limit, F.text)
 async def process_vless_limit(message: types.Message, state: FSMContext):
+    if not await is_logged_in(message):
+        await state.clear()
+        return
+    
     try:
         limit = int(message.text)
         if limit < 0:
@@ -138,9 +208,12 @@ async def process_vless_limit(message: types.Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# ========== ساخت کانفیگ جدید (گام سوم: دریافت مدت و ایجاد نهایی) ==========
 @router.message(UserCreation.waiting_for_days, F.text)
 async def process_vless_days(message: types.Message, state: FSMContext):
+    if not await is_logged_in(message):
+        await state.clear()
+        return
+    
     try:
         days = int(message.text)
         if days < 0:
@@ -153,13 +226,12 @@ async def process_vless_days(message: types.Message, state: FSMContext):
     name = data['name']
     limit_gb = data['limit']
     
-    # محاسبه تاریخ انقضا
     expiry_date = None
     if days > 0:
         expiry_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
     
-    # ارسال به پنل برای ساخت
     try:
+        api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
         result = await api.create_vless_user(
             name=name,
             limit_gb=limit_gb,
@@ -192,13 +264,16 @@ async def process_vless_days(message: types.Message, state: FSMContext):
 # ========== لیست کاربران ==========
 @router.message(F.text == "📋 لیست کاربران")
 async def cmd_list(message: types.Message):
+    if not await is_logged_in(message):
+        return
+    
     try:
+        api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
         users = await api.get_users()
         if not users:
             await message.answer("❌ هیچ کاربری یافت نشد.", reply_markup=get_main_menu())
             return
         
-        # نمایش لیست به صورت متن
         user_list = "📋 **لیست کاربران:**\n\n"
         for i, user in enumerate(users, 1):
             user_list += (
@@ -208,7 +283,6 @@ async def cmd_list(message: types.Message):
                 f"   📅 انقضا: {user.get('expiry', 'نامحدود')}\n\n"
             )
         
-        # ارسال لیست به همراه منوی اینلاین برای حذف سریع
         await message.answer(
             user_list,
             parse_mode="Markdown",
@@ -220,11 +294,15 @@ async def cmd_list(message: types.Message):
             reply_markup=get_main_menu()
         )
 
-# ========== حذف کاربر از طریق دکمه اینلاین ==========
+# ========== حذف کاربر از دکمه اینلاین ==========
 @router.callback_query(F.data.startswith("delete_user_"))
 async def delete_user_from_button(callback: types.CallbackQuery):
+    if not await is_logged_in(callback.message):
+        return
+    
     user_id = callback.data.split("_")[2]
     try:
+        api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
         result = await api.delete_user(user_id)
         if result.get('success'):
             await callback.message.edit_text(
@@ -246,6 +324,9 @@ async def delete_user_from_button(callback: types.CallbackQuery):
 # ========== حذف کاربر (دستور متنی) ==========
 @router.message(F.text == "❌ حذف کاربر")
 async def start_delete_user(message: types.Message, state: FSMContext):
+    if not await is_logged_in(message):
+        return
+    
     await state.set_state(UserDeletion.waiting_for_user_id)
     await message.answer(
         "🗑️ **شناسه کاربر مورد نظر را وارد کنید:**\n\n"
@@ -255,8 +336,13 @@ async def start_delete_user(message: types.Message, state: FSMContext):
 
 @router.message(UserDeletion.waiting_for_user_id, F.text)
 async def process_delete_user(message: types.Message, state: FSMContext):
+    if not await is_logged_in(message):
+        await state.clear()
+        return
+    
     user_id = message.text.strip()
     try:
+        api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
         result = await api.delete_user(user_id)
         if result.get('success'):
             await message.answer(
@@ -279,14 +365,17 @@ async def process_delete_user(message: types.Message, state: FSMContext):
 # ========== آمار پنل ==========
 @router.message(F.text == "📊 آمار پنل")
 async def cmd_stats(message: types.Message):
+    if not await is_logged_in(message):
+        return
+    
     try:
+        api = XUIApi(settings.PANEL_URL, settings.PANEL_LOGIN, settings.PANEL_PASSWORD)
         stats = await api.get_stats()
         stats_text = (
             "📊 **آمار کلی پنل**\n\n"
             f"👥 **تعداد کل کاربران:** {stats.get('total_users', 0)}\n"
             f"🟢 **کاربران فعال:** {stats.get('active_users', 0)}\n"
             f"🔴 **کاربران غیرفعال:** {stats.get('inactive_users', 0)}\n"
-            f"📈 **ترافیک مصرفی امروز:** {stats.get('today_traffic', 0)} GB\n"
             f"📊 **ترافیک کل مصرفی:** {stats.get('total_traffic', 0)} GB\n"
             f"💾 **وضعیت سرور:** {stats.get('server_status', 'نامشخص')}"
         )
@@ -297,7 +386,7 @@ async def cmd_stats(message: types.Message):
             reply_markup=get_main_menu()
         )
 
-# ========== بازگشت به منو از دکمه اینلاین ==========
+# ========== بازگشت به منو ==========
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: types.CallbackQuery):
     await callback.message.delete()
@@ -313,8 +402,11 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 # ========== پاسخ به پیام‌های ناشناخته ==========
 @router.message()
 async def handle_unknown(message: types.Message):
+    if message.text in ["🔑 ورود به پنل", "➕ ساخت کانفیگ جدید", "📋 لیست کاربران", "❌ حذف کاربر", "📊 آمار پنل", "🔐 خروج از پنل"]:
+        return
+    
     await message.answer(
         "❓ دستور یا پیام ناشناخته.\n"
         "لطفاً از دکمه‌های منو استفاده کنید یا /help را بزنید.",
-        reply_markup=get_main_menu()
+        reply_markup=get_main_menu() if user_sessions.get(message.from_user.id) else get_login_menu()
     )
