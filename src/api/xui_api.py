@@ -17,23 +17,22 @@ class XUIApi:
         self.logged_in = False
 
     async def _login_panel(self):
-        """ورود به پنل myx با رمز عبور (بدون نام کاربری)"""
+        """ورود به پنل myx با رمز عبور"""
         try:
             login_url = f"{self.base_url}/login"
             
             async with aiohttp.ClientSession() as session:
-                # دریافت صفحه لاگین برای گرفتن CSRF token (اگر لازم باشد)
+                # مرحله 1: دریافت کوکی
                 async with session.get(login_url) as response:
                     if response.status == 200:
-                        # لاگین با رمز عبور
+                        # مرحله 2: ارسال رمز عبور
                         payload = {"password": self.password}
                         
                         async with session.post(login_url, data=payload) as login_response:
                             self.cookies = login_response.cookies
                             
-                            if login_response.status == 200 or login_response.status == 302:
+                            if login_response.status in [200, 302]:
                                 self.logged_in = True
-                                logging.info("Login successful")
                                 return True
             
             raise Exception("Login failed")
@@ -57,7 +56,7 @@ class XUIApi:
             
             async with aiohttp.ClientSession(cookies=self.cookies) as session:
                 async with session.request(method, url, timeout=15, **kwargs) as response:
-                    if response.status == 401:
+                    if response.status in [401, 403]:
                         await self._login_panel()
                         if self.cookies:
                             kwargs['cookies'] = self.cookies
@@ -87,84 +86,8 @@ class XUIApi:
         except:
             return {"success": False, "msg": "Invalid JSON"}
 
-    async def get_inbound(self, inbound_id):
-        """دریافت اطلاعات اینباند (در پنل myx همیشه 1 است)"""
-        try:
-            # در پنل myx، اینباند پیش‌فرض همیشه ID=1 دارد
-            if inbound_id == 1:
-                return {
-                    "id": 1,
-                    "port": 443,
-                    "remark": "VLESS",
-                    "streamSettings": json.dumps({
-                        "network": "ws",
-                        "security": "tls",
-                        "wsSettings": {
-                            "path": "/b6e0f80e8273"
-                        }
-                    }),
-                    "settings": json.dumps({"clients": []})
-                }
-            
-            raise ValueError(f"Inbound with ID {inbound_id} not found")
-        except Exception as e:
-            logging.error(f"Error getting inbound: {e}")
-            raise
-
-    async def add_client_to_inbound(self, inbound_id, client_remark, total_gb=0, expiry_days=0, flow=""):
-        """اضافه کردن کاربر (روش مستقیم با API پنل myx)"""
-        try:
-            new_uuid = str(uuid.uuid4())
-            
-            # استفاده از API مستقیم پنل myx
-            api_url = f"{self.base_url}/api/users"
-            
-            # محاسبه تاریخ انقضا
-            expiry_date = None
-            if expiry_days > 0:
-                expiry_date = (datetime.now() + timedelta(days=expiry_days)).strftime("%Y-%m-%d")
-            
-            payload = {
-                "username": client_remark.replace("user-", ""),
-                "uuid": new_uuid,
-                "limit": total_gb if total_gb > 0 else 0,
-                "days": expiry_days if expiry_days > 0 else 0,
-                "expiry": expiry_date
-            }
-            
-            response = await self._make_request("post", api_url, json=payload)
-            
-            if response.get("success"):
-                return new_uuid
-            else:
-                raise Exception("Failed to add user")
-        except Exception as e:
-            logging.error(f"Error adding client: {e}")
-            raise
-
-    async def get_vless_uri(self, inbound_id, client_uuid, remark, inbound_data=None):
-        """ساخت لینک کانفیگ برای پنل myx"""
-        server_address = settings.PUBLIC_HOST.replace("https://", "").replace("http://", "")
-        port = 443
-        path = "/b6e0f80e8273"  # مسیر پیش‌فرض پنل myx
-        
-        # پارامترهای لینک
-        params = {
-            "type": "ws",
-            "security": "tls",
-            "host": server_address,
-            "sni": server_address,
-            "fp": "chrome",
-            "path": path
-        }
-
-        query_string = urlencode(params, quote_via=quote)
-        
-        uri = f"vless://{client_uuid}@{server_address}:{port}?{query_string}#{remark}"
-        return uri
-
     async def create_vless_user(self, name, limit_gb=0, expiry_date=None, inbound_id=None):
-        """ساخت کاربر جدید در پنل myx"""
+        """ساخت کاربر جدید"""
         try:
             client_remark = f"user-{name.lower().replace(' ', '-')[:20]}"
             
@@ -177,30 +100,50 @@ class XUIApi:
                 except:
                     expiry_days = 0
             
-            # اضافه کردن کاربر
-            client_uuid = await self.add_client_to_inbound(
-                inbound_id=1,
-                client_remark=client_remark,
-                total_gb=limit_gb,
-                expiry_days=expiry_days,
-                flow=""
-            )
+            # اضافه کردن کاربر با API پنل myx
+            api_url = f"{self.base_url}/api/users"
+            new_uuid = str(uuid.uuid4())
             
-            # ساخت لینک
-            config_link = await self.get_vless_uri(
-                inbound_id=1,
-                client_uuid=client_uuid,
-                remark=name
-            )
-            
-            return {
-                'success': True,
-                'uuid': client_uuid,
-                'link': config_link,
-                'name': name,
-                'limit_gb': limit_gb,
-                'expiry_date': expiry_date
+            payload = {
+                "username": client_remark.replace("user-", ""),
+                "uuid": new_uuid,
+                "limit": limit_gb if limit_gb > 0 else 0,
+                "days": expiry_days if expiry_days > 0 else 0,
+                "expiry": expiry_date
             }
+            
+            response = await self._make_request("post", api_url, json=payload)
+            
+            if response.get("success"):
+                # ساخت لینک کانفیگ
+                server_address = settings.PUBLIC_HOST.replace("https://", "").replace("http://", "")
+                path = "/b6e0f80e8273"
+                
+                params = {
+                    "type": "ws",
+                    "security": "tls",
+                    "host": server_address,
+                    "sni": server_address,
+                    "fp": "chrome",
+                    "path": path
+                }
+
+                query_string = urlencode(params, quote_via=quote)
+                config_link = f"vless://{new_uuid}@{server_address}:443?{query_string}#{name}"
+                
+                return {
+                    'success': True,
+                    'uuid': new_uuid,
+                    'link': config_link,
+                    'name': name,
+                    'limit_gb': limit_gb,
+                    'expiry_date': expiry_date
+                }
+            else:
+                return {
+                    'success': False,
+                    'message': 'خطا در ساخت کاربر'
+                }
         except Exception as e:
             logging.error(f"Error creating user: {e}")
             return {
@@ -209,9 +152,8 @@ class XUIApi:
             }
 
     async def get_users(self):
-        """دریافت لیست کاربران از پنل myx"""
+        """دریافت لیست کاربران"""
         try:
-            # استفاده از API مستقیم پنل myx
             api_url = f"{self.base_url}/api/users"
             response = await self._make_request("get", api_url)
             
@@ -234,7 +176,7 @@ class XUIApi:
             return []
 
     async def delete_user(self, user_id):
-        """حذف کاربر از پنل myx"""
+        """حذف کاربر"""
         try:
             api_url = f"{self.base_url}/api/users/{user_id}"
             response = await self._make_request("delete", api_url)
@@ -247,7 +189,7 @@ class XUIApi:
             return {'success': False, 'message': str(e)}
 
     async def get_stats(self):
-        """دریافت آمار از پنل myx"""
+        """دریافت آمار"""
         try:
             users = await self.get_users()
             total_users = len(users)
