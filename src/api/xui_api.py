@@ -279,3 +279,165 @@ class XUIApi:
 
         self._update_xray_config()
         return True
+
+    def get_stats(self):
+        """دریافت آمار کلی پنل (همزمان)"""
+        try:
+            # دریافت لیست اینباندها برای محاسبه آمار
+            url = self._build_url("panel/api/inbounds/list")
+            response = self._make_request("get", url)
+            
+            if not response.get("success"):
+                return {
+                    'total_users': 0,
+                    'today_traffic': 0,
+                    'total_traffic': 0,
+                    'server_status': 'خطا در دریافت آمار'
+                }
+            
+            inbounds = response.get("obj", [])
+            total_users = 0
+            total_traffic_bytes = 0
+            
+            for inbound in inbounds:
+                settings = json.loads(inbound.get("settings", "{}"))
+                clients = settings.get("clients", [])
+                total_users += len(clients)
+                
+                # جمع ترافیک کل از تمام اینباندها
+                total_traffic_bytes += inbound.get("up", 0) + inbound.get("down", 0)
+            
+            # تبدیل بایت به گیگابایت
+            total_traffic_gb = round(total_traffic_bytes / (1024**3), 2)
+            
+            return {
+                'total_users': total_users,
+                'today_traffic': 0,  # در این API جداگانه موجود نیست
+                'total_traffic': total_traffic_gb,
+                'server_status': 'فعال',
+                'total_inbounds': len(inbounds)
+            }
+        except Exception as e:
+            logging.error(f"Error getting stats: {e}")
+            return {
+                'total_users': 0,
+                'today_traffic': 0,
+                'total_traffic': 0,
+                'server_status': 'خطا در دریافت',
+                'error': str(e)
+            }
+
+    def create_vless_user(self, name, limit_gb=0, expiry_date=None, inbound_id=None):
+        """ساخت کاربر VLESS جدید با امکانات کامل"""
+        try:
+            # اگر inbound_id داده نشده، از تنظیمات استفاده کن
+            if inbound_id is None:
+                inbound_id = settings.VLESS_INBOUND_ID
+            
+            # ساخت remark برای کاربر
+            client_remark = f"user-{name.lower().replace(' ', '-')[:20]}"
+            
+            # محاسبه روزهای باقی‌مانده تا تاریخ انقضا
+            expiry_days = 0
+            if expiry_date:
+                expiry_dt = datetime.strptime(expiry_date, "%Y-%m-%d")
+                delta = expiry_dt - datetime.now()
+                expiry_days = max(0, delta.days)
+            
+            # اضافه کردن کاربر به اینباند
+            client_uuid = self.add_client_to_inbound(
+                inbound_id=inbound_id,
+                client_remark=client_remark,
+                total_gb=limit_gb,
+                expiry_days=expiry_days,
+                flow="xtls-rprx-vision-udp443"
+            )
+            
+            # دریافت لینک کانفیگ
+            config_link = self.get_vless_uri(
+                inbound_id=inbound_id,
+                client_uuid=client_uuid,
+                remark=name
+            )
+            
+            return {
+                'success': True,
+                'uuid': client_uuid,
+                'link': config_link,
+                'name': name,
+                'limit_gb': limit_gb,
+                'expiry_date': expiry_date
+            }
+        except Exception as e:
+            logging.error(f"Error creating VLESS user: {e}")
+            return {
+                'success': False,
+                'message': str(e)
+            }
+
+    def delete_user(self, user_id):
+        """حذف کاربر با شناسه"""
+        try:
+            # پیدا کردن کاربر در اینباندها
+            url = self._build_url("panel/api/inbounds/list")
+            response = self._make_request("get", url)
+            
+            if not response.get("success"):
+                return {'success': False, 'message': 'دریافت لیست اینباندها失敗'}
+            
+            for inbound in response.get("obj", []):
+                settings = json.loads(inbound.get("settings", "{}"))
+                clients = settings.get("clients", [])
+                
+                for client in clients:
+                    if str(client.get('id')) == str(user_id):
+                        # حذف کاربر از اینباند
+                        del_url = self._build_url(
+                            "panel/api/inbounds", inbound['id'], "delClient", user_id
+                        )
+                        del_response = self._make_request("post", del_url)
+                        if del_response.get('success'):
+                            return {'success': True, 'message': 'کاربر با موفقیت حذف شد'}
+                        else:
+                            return {'success': False, 'message': del_response.get('msg', 'خطا در حذف')}
+            
+            return {'success': False, 'message': 'کاربر یافت نشد'}
+        except Exception as e:
+            logging.error(f"Error deleting user: {e}")
+            return {'success': False, 'message': str(e)}
+
+    def get_users(self):
+        """دریافت لیست کامل کاربران"""
+        try:
+            url = self._build_url("panel/api/inbounds/list")
+            response = self._make_request("get", url)
+            
+            if not response.get("success"):
+                return []
+            
+            users = []
+            for inbound in response.get("obj", []):
+                settings = json.loads(inbound.get("settings", "{}"))
+                clients = settings.get("clients", [])
+                
+                for client in clients:
+                    # محاسبه حجم مصرفی و باقی‌مانده
+                    total_gb = client.get('totalGB', 0) / (1024**3)
+                    expiry_time = client.get('expiryTime', 0)
+                    expiry_date = None
+                    if expiry_time > 0:
+                        expiry_date = datetime.fromtimestamp(expiry_time / 1000).strftime("%Y-%m-%d")
+                    
+                    users.append({
+                        'id': client.get('id'),
+                        'name': client.get('email', '').replace('user-', ''),
+                        'limit': round(total_gb, 2) if total_gb > 0 else 'نامحدود',
+                        'expiry': expiry_date if expiry_date else 'نامحدود',
+                        'enable': client.get('enable', True),
+                        'inbound_id': inbound.get('id')
+                    })
+            
+            return users
+        except Exception as e:
+            logging.error(f"Error getting users: {e}")
+            return []
