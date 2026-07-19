@@ -17,25 +17,32 @@ class XUIApi:
         self.logged_in = False
 
     async def _login_panel(self):
-        """ورود به پنل myx با رمز عبور"""
+        """ورود به پنل myx با استفاده از کوکی"""
         try:
-            login_url = f"{self.base_url}/login"
-            
             async with aiohttp.ClientSession() as session:
-                # مرحله 1: دریافت کوکی
-                async with session.get(login_url) as response:
-                    if response.status == 200:
-                        # مرحله 2: ارسال رمز عبور
-                        payload = {"password": self.password}
-                        
-                        async with session.post(login_url, data=payload) as login_response:
+                # 1. دریافت کوکی از صفحه لاگین
+                async with session.get(f"{self.base_url}/login") as response:
+                    if response.status != 200:
+                        raise Exception("Cannot access login page")
+                    
+                    # 2. ارسال رمز عبور
+                    payload = {"password": self.password}
+                    async with session.post(f"{self.base_url}/login", data=payload) as login_response:
+                        if login_response.status in [200, 302]:
                             self.cookies = login_response.cookies
-                            
-                            if login_response.status in [200, 302]:
+                            self.logged_in = True
+                            logging.info("Login successful")
+                            return True
+                        
+                        # 3. اگر POST کار نکرد، با GET امتحان کن
+                        async with session.get(f"{self.base_url}/dashboard") as dash_response:
+                            if dash_response.status == 200:
+                                self.cookies = dash_response.cookies
                                 self.logged_in = True
+                                logging.info("Login successful via GET")
                                 return True
-            
-            raise Exception("Login failed")
+                        
+                        raise Exception("Login failed")
         except Exception as e:
             logging.error(f"Login error: {e}")
             raise
@@ -87,63 +94,65 @@ class XUIApi:
             return {"success": False, "msg": "Invalid JSON"}
 
     async def create_vless_user(self, name, limit_gb=0, expiry_date=None, inbound_id=None):
-        """ساخت کاربر جدید"""
+        """ساخت کاربر جدید با روش مستقیم"""
         try:
-            client_remark = f"user-{name.lower().replace(' ', '-')[:20]}"
+            # 1. لاگین مجدد برای اطمینان
+            await self._login_panel()
             
-            expiry_days = 0
-            if expiry_date:
-                try:
-                    expiry_dt = datetime.strptime(expiry_date, "%Y-%m-%d")
-                    delta = expiry_dt - datetime.now()
-                    expiry_days = max(0, delta.days)
-                except:
-                    expiry_days = 0
-            
-            # اضافه کردن کاربر با API پنل myx
-            api_url = f"{self.base_url}/api/users"
+            # 2. ساخت UUID جدید
             new_uuid = str(uuid.uuid4())
             
+            # 3. ارسال درخواست به API پنل
+            api_url = f"{self.base_url}/api/users"
+            
             payload = {
-                "username": client_remark.replace("user-", ""),
+                "username": name,
                 "uuid": new_uuid,
                 "limit": limit_gb if limit_gb > 0 else 0,
-                "days": expiry_days if expiry_days > 0 else 0,
-                "expiry": expiry_date
+                "days": 2 if not expiry_date else 0,
+                "expiry": expiry_date if expiry_date else None
             }
             
-            response = await self._make_request("post", api_url, json=payload)
-            
-            if response.get("success"):
-                # ساخت لینک کانفیگ
-                server_address = settings.PUBLIC_HOST.replace("https://", "").replace("http://", "")
-                path = "/b6e0f80e8273"
-                
-                params = {
-                    "type": "ws",
-                    "security": "tls",
-                    "host": server_address,
-                    "sni": server_address,
-                    "fp": "chrome",
-                    "path": path
-                }
+            # 4. ارسال با کوکی
+            async with aiohttp.ClientSession(cookies=self.cookies) as session:
+                async with session.post(api_url, json=payload, timeout=15) as response:
+                    if response.status == 200:
+                        try:
+                            result = await response.json()
+                            if result.get('success'):
+                                # ساخت لینک کانفیگ
+                                server_address = settings.PUBLIC_HOST.replace("https://", "").replace("http://", "")
+                                path = "/b6e0f80e8273"
+                                
+                                params = {
+                                    "type": "ws",
+                                    "security": "tls",
+                                    "host": server_address,
+                                    "sni": server_address,
+                                    "fp": "chrome",
+                                    "path": path
+                                }
 
-                query_string = urlencode(params, quote_via=quote)
-                config_link = f"vless://{new_uuid}@{server_address}:443?{query_string}#{name}"
-                
-                return {
-                    'success': True,
-                    'uuid': new_uuid,
-                    'link': config_link,
-                    'name': name,
-                    'limit_gb': limit_gb,
-                    'expiry_date': expiry_date
-                }
-            else:
-                return {
-                    'success': False,
-                    'message': 'خطا در ساخت کاربر'
-                }
+                                query_string = urlencode(params, quote_via=quote)
+                                config_link = f"vless://{new_uuid}@{server_address}:443?{query_string}#{name}"
+                                
+                                return {
+                                    'success': True,
+                                    'uuid': new_uuid,
+                                    'link': config_link,
+                                    'name': name,
+                                    'limit_gb': limit_gb,
+                                    'expiry_date': expiry_date
+                                }
+                    elif response.status == 401:
+                        # اگر لاگین منقضی شده
+                        await self._login_panel()
+                        return await self.create_vless_user(name, limit_gb, expiry_date)
+            
+            return {
+                'success': False,
+                'message': 'خطا در ارتباط با پنل'
+            }
         except Exception as e:
             logging.error(f"Error creating user: {e}")
             return {
@@ -154,21 +163,28 @@ class XUIApi:
     async def get_users(self):
         """دریافت لیست کاربران"""
         try:
-            api_url = f"{self.base_url}/api/users"
-            response = await self._make_request("get", api_url)
+            await self._login_panel()
             
-            if response.get("success") and response.get("users"):
-                users = []
-                for user in response.get("users", []):
-                    users.append({
-                        'id': user.get('uuid'),
-                        'name': user.get('username', ''),
-                        'limit': user.get('limit', 'نامحدود'),
-                        'expiry': user.get('expiry', 'نامحدود'),
-                        'enable': user.get('active', True),
-                        'inbound_id': 1
-                    })
-                return users
+            api_url = f"{self.base_url}/api/users"
+            async with aiohttp.ClientSession(cookies=self.cookies) as session:
+                async with session.get(api_url, timeout=15) as response:
+                    if response.status == 200:
+                        try:
+                            result = await response.json()
+                            if result.get('success') and result.get('users'):
+                                users = []
+                                for user in result.get('users', []):
+                                    users.append({
+                                        'id': user.get('uuid'),
+                                        'name': user.get('username', ''),
+                                        'limit': user.get('limit', 'نامحدود'),
+                                        'expiry': user.get('expiry', 'نامحدود'),
+                                        'enable': user.get('active', True),
+                                        'inbound_id': 1
+                                    })
+                                return users
+                        except:
+                            pass
             
             return []
         except Exception as e:
@@ -178,13 +194,20 @@ class XUIApi:
     async def delete_user(self, user_id):
         """حذف کاربر"""
         try:
-            api_url = f"{self.base_url}/api/users/{user_id}"
-            response = await self._make_request("delete", api_url)
+            await self._login_panel()
             
-            if response.get("success"):
-                return {'success': True, 'message': 'کاربر با موفقیت حذف شد'}
-            else:
-                return {'success': False, 'message': 'خطا در حذف کاربر'}
+            api_url = f"{self.base_url}/api/users/{user_id}"
+            async with aiohttp.ClientSession(cookies=self.cookies) as session:
+                async with session.delete(api_url, timeout=15) as response:
+                    if response.status == 200:
+                        try:
+                            result = await response.json()
+                            if result.get('success'):
+                                return {'success': True, 'message': 'کاربر با موفقیت حذف شد'}
+                        except:
+                            pass
+            
+            return {'success': False, 'message': 'خطا در حذف کاربر'}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
