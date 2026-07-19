@@ -28,7 +28,8 @@ def get_main_menu():
         [KeyboardButton(text="➕ ساخت کانفیگ جدید")],
         [KeyboardButton(text="📋 لیست کاربران")],
         [KeyboardButton(text="❌ حذف کاربر")],
-        [KeyboardButton(text="📊 آمار پنل"), KeyboardButton(text="ℹ️ راهنما")]
+        [KeyboardButton(text="📊 آمار پنل"), KeyboardButton(text="🔐 ورود به پنل")],
+        [KeyboardButton(text="ℹ️ راهنما")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -37,12 +38,16 @@ def get_users_inline_menu(users):
     """ساخت منوی اینلاین برای لیست کاربران با دکمه حذف"""
     keyboard = InlineKeyboardMarkup(row_width=1)
     for user in users:
-        keyboard.add(
-            InlineKeyboardButton(
-                text=f"🗑️ حذف {user.get('name', 'بی‌نام')}",
-                callback_data=f"delete_user_{user.get('id')}"
+        # اطمینان از وجود name و id
+        user_name = user.get('name', 'بی‌نام')
+        user_id = user.get('id')
+        if user_id:
+            keyboard.add(
+                InlineKeyboardButton(
+                    text=f"🗑️ حذف {user_name}",
+                    callback_data=f"delete_user_{user_id}"
+                )
             )
-        )
     keyboard.add(InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_to_menu"))
     return keyboard
 
@@ -67,9 +72,28 @@ async def cmd_help(message: types.Message):
         "✅ **حذف کاربر:**\n"
         "روی دکمه «❌ حذف کاربر» کلیک کنید و شناسه کاربر را وارد کنید.\n\n"
         "✅ **آمار پنل:**\n"
-        "برای مشاهده وضعیت کلی پنل، روی دکمه «📊 آمار پنل» کلیک کنید."
+        "برای مشاهده وضعیت کلی پنل، روی دکمه «📊 آمار پنل» کلیک کنید.\n\n"
+        "✅ **ورود به پنل:**\n"
+        "روی دکمه «🔐 ورود به پنل» کلیک کنید تا آدرس و رمز عبور پنل را دریافت کنید."
     )
-    await message.answer(help_text, parse_mode="Markdown")
+    await message.answer(help_text, parse_mode="Markdown", reply_markup=get_main_menu())
+
+# ========== دکمه ورود به پنل ==========
+@router.message(F.text == "🔐 ورود به پنل")
+async def cmd_panel_login(message: types.Message):
+    """ارسال لینک و رمز عبور پنل به کاربر"""
+    panel_url = settings.PANEL_URL
+    password = settings.PANEL_PASSWORD
+    
+    await message.answer(
+        f"🔐 **ورود به پنل مدیریت**\n\n"
+        f"🌐 **آدرس پنل:**\n{panel_url}\n\n"
+        f"🔑 **رمز عبور:**\n`{password}`\n\n"
+        f"💡 برای ورود، روی لینک کلیک کرده و رمز عبور را وارد کنید.\n"
+        f"⚠️ **توجه:** این پنل فقط با رمز عبور کار می‌کند و نیازی به نام کاربری ندارد.",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu()
+    )
 
 # ========== ساخت کانفیگ جدید (گام اول: دریافت نام) ==========
 @router.message(F.text == "➕ ساخت کانفیگ جدید")
@@ -78,7 +102,8 @@ async def start_vless_creation(message: types.Message, state: FSMContext):
     await message.answer(
         "📝 **لطفاً نام کاربر را وارد کنید:**\n\n"
         "نام باید فقط شامل حروف، اعداد و خط تیره باشد.",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=get_main_menu()
     )
 
 @router.message(UserCreation.waiting_for_name, F.text)
@@ -255,10 +280,12 @@ async def process_delete_user(message: types.Message, state: FSMContext):
 @router.message(F.text == "📊 آمار پنل")
 async def cmd_stats(message: types.Message):
     try:
-        stats = await api.get_stats()  # تابع دریافت آمار را باید در xui_api.py بسازید
+        stats = await api.get_stats()
         stats_text = (
             "📊 **آمار کلی پنل**\n\n"
             f"👥 **تعداد کل کاربران:** {stats.get('total_users', 0)}\n"
+            f"🟢 **کاربران فعال:** {stats.get('active_users', 0)}\n"
+            f"🔴 **کاربران غیرفعال:** {stats.get('inactive_users', 0)}\n"
             f"📈 **ترافیک مصرفی امروز:** {stats.get('today_traffic', 0)} GB\n"
             f"📊 **ترافیک کل مصرفی:** {stats.get('total_traffic', 0)} GB\n"
             f"💾 **وضعیت سرور:** {stats.get('server_status', 'نامشخص')}"
