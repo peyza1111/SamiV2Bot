@@ -6,6 +6,7 @@ from datetime import datetime
 from urllib.parse import quote, urlencode
 
 import aiohttp
+import requests
 from src.core.config import settings
 
 
@@ -18,60 +19,87 @@ class XUIApi:
         self.cookies = None
         self.logged_in = False
 
+    async def _login_panel(self):
+        """ورود به پنل myx با روش ساده"""
+        try:
+            # روش ساده: ارسال درخواست به صفحه لاگین
+            login_url = f"{self.base_url}/login"
+            
+            async with aiohttp.ClientSession() as session:
+                # ابتدا صفحه لاگین رو دریافت کن
+                async with session.get(login_url) as response:
+                    if response.status == 200:
+                        # حالا لاگین رو انجام بده
+                        payload = {
+                            "username": self.username,
+                            "password": self.password,
+                            "login": "login"  # بعضی پنل‌ها نیاز دارن
+                        }
+                        
+                        async with session.post(login_url, data=payload) as login_response:
+                            self.cookies = login_response.cookies
+                            
+                            if login_response.status == 200 or login_response.status == 302:
+                                self.logged_in = True
+                                logging.info("Login successful")
+                                return True
+                            
+            # اگر روش اول کار نکرد، روش دوم
+            async with aiohttp.ClientSession() as session:
+                payload = {"username": self.username, "password": self.password}
+                async with session.post(login_url, json=payload) as response:
+                    if response.status == 200:
+                        self.cookies = response.cookies
+                        self.logged_in = True
+                        logging.info("Login successful (JSON)")
+                        return True
+            
+            raise Exception("Login failed")
+        except Exception as e:
+            logging.error(f"Login error: {e}")
+            raise
+
     async def _ensure_session(self):
         if self.session is None:
             self.session = aiohttp.ClientSession()
             await self._login_panel()
         return self.session
 
-    async def _login_panel(self):
-        """ورود به پنل با روش ساده"""
-        try:
-            login_url = f"{self.base_url}/login"
-            payload = {"username": self.username, "password": self.password}
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(login_url, data=payload, timeout=10) as response:
-                    if response.status == 200:
-                        self.cookies = response.cookies
-                        self.logged_in = True
-                        logging.info("Login successful")
-                        return True
-                    else:
-                        raise Exception(f"Login failed with status: {response.status}")
-        except Exception as e:
-            logging.error(f"Login error: {e}")
-            raise
-
     async def _make_request(self, method, url, **kwargs):
-        """ارسال درخواست با کوکی"""
-        await self._ensure_session()
-        
-        if self.cookies:
-            kwargs.setdefault('cookies', self.cookies)
-        
+        """ارسال درخواست با مدیریت خودکار لاگین"""
         try:
-            async with self.session.request(method, url, timeout=15, **kwargs) as response:
-                # اگر لاگین منقضی شده بود
-                if response.status in [401, 403]:
-                    await self._login_panel()
-                    if self.cookies:
-                        kwargs['cookies'] = self.cookies
-                    async with self.session.request(method, url, timeout=15, **kwargs) as retry_response:
-                        return await self._handle_response(retry_response)
-                
-                return await self._handle_response(response)
+            # اگر لاگین نکردیم، لاگین کن
+            if not self.logged_in:
+                await self._login_panel()
+            
+            if self.cookies:
+                kwargs.setdefault('cookies', self.cookies)
+            
+            async with aiohttp.ClientSession(cookies=self.cookies) as session:
+                async with session.request(method, url, timeout=15, **kwargs) as response:
+                    # اگر لاگین منقضی شده بود
+                    if response.status == 401:
+                        await self._login_panel()
+                        if self.cookies:
+                            kwargs['cookies'] = self.cookies
+                        async with aiohttp.ClientSession(cookies=self.cookies) as retry_session:
+                            async with retry_session.request(method, url, timeout=15, **kwargs) as retry_response:
+                                return await self._handle_response(retry_response)
+                    
+                    return await self._handle_response(response)
         except Exception as e:
             logging.error(f"Request error: {e}")
             raise
 
     async def _handle_response(self, response):
-        """پردازش پاسخ"""
         try:
             text = await response.text()
             
-            # اگر پاسخ HTML بود
             if "<!DOCTYPE" in text or "<html" in text:
+                # اگر HTML برگشت، یعنی خطا یا لاگین
+                if "login" in text.lower():
+                    self.logged_in = False
+                    return {"success": False, "msg": "Please login"}
                 return {"success": False, "msg": "Invalid response"}
             
             if not text or text.strip() == "":
@@ -82,25 +110,24 @@ class XUIApi:
             return {"success": False, "msg": "Invalid JSON"}
 
     async def get_inbound(self, inbound_id):
-        """دریافت اطلاعات اینباند با شناسه"""
+        """دریافت اطلاعات اینباند"""
         try:
-            # دریافت لیست اینباندها
-            url = f"{self.base_url}/panel/api/inbounds/list"
-            response = await self._make_request("get", url)
+            # مسیرهای مختلف API
+            api_paths = [
+                f"{self.base_url}/api/inbounds/list",
+                f"{self.base_url}/panel/api/inbounds/list",
+                f"{self.base_url}/xui/API/inbounds/list"
+            ]
             
-            if response.get("success") and response.get("obj"):
-                for inbound in response.get("obj", []):
-                    if inbound.get("id") == inbound_id:
-                        return inbound
-            
-            # اگر پیدا نشد، با مسیر جایگزین امتحان کن
-            url = f"{self.base_url}/api/inbounds/list"
-            response = await self._make_request("get", url)
-            
-            if response.get("success") and response.get("obj"):
-                for inbound in response.get("obj", []):
-                    if inbound.get("id") == inbound_id:
-                        return inbound
+            for url in api_paths:
+                try:
+                    response = await self._make_request("get", url)
+                    if response.get("success") and response.get("obj"):
+                        for inbound in response.get("obj", []):
+                            if inbound.get("id") == inbound_id:
+                                return inbound
+                except:
+                    continue
             
             raise ValueError(f"Inbound with ID {inbound_id} not found")
         except Exception as e:
@@ -108,7 +135,7 @@ class XUIApi:
             raise
 
     async def add_client_to_inbound(self, inbound_id, client_remark, total_gb=0, expiry_days=0, flow=""):
-        """اضافه کردن کاربر به اینباند"""
+        """اضافه کردن کاربر"""
         new_uuid = str(uuid.uuid4())
         
         total_bytes = int(total_gb * 1024**3) if total_gb > 0 else 0
@@ -133,14 +160,14 @@ class XUIApi:
         settings_payload = {"clients": [client_object]}
         payload = {"id": inbound_id, "settings": json.dumps(settings_payload)}
         
-        # تلاش با مسیرهای مختلف
-        urls = [
-            f"{self.base_url}/panel/api/inbounds/addClient",
+        # مسیرهای مختلف
+        api_paths = [
             f"{self.base_url}/api/inbounds/addClient",
+            f"{self.base_url}/panel/api/inbounds/addClient",
             f"{self.base_url}/xui/API/inbounds/addClient"
         ]
         
-        for url in urls:
+        for url in api_paths:
             try:
                 response = await self._make_request("post", url, data=payload)
                 if response.get("success"):
@@ -155,7 +182,6 @@ class XUIApi:
         if not inbound_data:
             inbound_data = await self.get_inbound(inbound_id)
 
-        # تنظیمات پیش‌فرض
         server_address = settings.PUBLIC_HOST.replace("https://", "").replace("http://", "")
         port = inbound_data.get("port", 443)
         
@@ -179,7 +205,6 @@ class XUIApi:
 
         query_string = urlencode(params, quote_via=quote)
         
-        # ساخت لینک
         uri = f"vless://{client_uuid}@{server_address}:{port}?{query_string}#{remark}"
         return uri
 
@@ -191,7 +216,6 @@ class XUIApi:
             
             client_remark = f"user-{name.lower().replace(' ', '-')[:20]}"
             
-            # محاسبه روزهای باقی‌مانده
             expiry_days = 0
             if expiry_date:
                 try:
@@ -201,7 +225,7 @@ class XUIApi:
                 except:
                     expiry_days = 0
             
-            # گرفتن اطلاعات اینباند
+            # دریافت اطلاعات اینباند
             inbound_data = await self.get_inbound(inbound_id)
             
             # اضافه کردن کاربر
@@ -239,15 +263,14 @@ class XUIApi:
     async def get_users(self):
         """دریافت لیست کاربران"""
         try:
-            # تلاش با مسیرهای مختلف
-            urls = [
-                f"{self.base_url}/panel/api/inbounds/list",
+            api_paths = [
                 f"{self.base_url}/api/inbounds/list",
+                f"{self.base_url}/panel/api/inbounds/list",
                 f"{self.base_url}/xui/API/inbounds/list"
             ]
             
             users = []
-            for url in urls:
+            for url in api_paths:
                 try:
                     response = await self._make_request("get", url)
                     if response.get("success") and response.get("obj"):
@@ -286,7 +309,6 @@ class XUIApi:
     async def delete_user(self, user_id):
         """حذف کاربر"""
         try:
-            # پیدا کردن کاربر
             users = await self.get_users()
             target_user = None
             inbound_id = None
@@ -300,14 +322,13 @@ class XUIApi:
             if not target_user:
                 return {'success': False, 'message': 'کاربر یافت نشد'}
             
-            # حذف کاربر با مسیرهای مختلف
-            urls = [
-                f"{self.base_url}/panel/api/inbounds/{inbound_id}/delClient/{user_id}",
+            api_paths = [
                 f"{self.base_url}/api/inbounds/{inbound_id}/delClient/{user_id}",
+                f"{self.base_url}/panel/api/inbounds/{inbound_id}/delClient/{user_id}",
                 f"{self.base_url}/xui/API/inbounds/{inbound_id}/delClient/{user_id}"
             ]
             
-            for url in urls:
+            for url in api_paths:
                 try:
                     response = await self._make_request("post", url)
                     if response.get("success"):
