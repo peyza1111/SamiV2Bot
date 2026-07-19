@@ -2,7 +2,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import quote, urlencode, urljoin
 
 import aiohttp
@@ -19,31 +19,25 @@ class XUIApi:
         self.logged_in = False
 
     def _build_url(self, *parts):
-        """ساخت URL کامل"""
         path = "/".join(map(str, parts))
         return urljoin(self.base_url + "/", path)
 
     async def _ensure_session(self):
-        """اطمینان از وجود session و لاگین"""
         if self.session is None:
             self.session = aiohttp.ClientSession()
             await self.login()
         return self.session
 
     async def _make_request(self, method, url, **kwargs):
-        """ارسال درخواست با مدیریت خودکار لاگین"""
         session = await self._ensure_session()
         
-        # اضافه کردن کوکی‌ها در صورت وجود
         if self.cookies:
             kwargs.setdefault('cookies', self.cookies)
         
         try:
             async with session.request(method, url, timeout=15, **kwargs) as response:
-                # اگر لاگین منقضی شده، دوباره لاگین کن
                 if response.status == 401 or "login" in str(response.url):
                     await self.login()
-                    # ارسال مجدد درخواست با کوکی جدید
                     if self.cookies:
                         kwargs['cookies'] = self.cookies
                     async with session.request(method, url, timeout=15, **kwargs) as retry_response:
@@ -54,30 +48,22 @@ class XUIApi:
             raise ConnectionError(f"Request failed: {e}")
 
     async def _handle_response(self, response):
-        """پردازش پاسخ دریافتی با تشخیص JSON یا HTML"""
         try:
             text = await response.text()
             
-            # اگر پاسخ HTML است (خطا یا صفحه لاگین)
             if "<!DOCTYPE" in text or "<html" in text:
-                logging.warning(f"Received HTML response instead of JSON. Status: {response.status}")
-                if "login" in text.lower():
-                    self.logged_in = False
-                    raise ConnectionError("Session expired. Please login again.")
-                return {"success": False, "msg": "Invalid response from panel"}
+                logging.warning(f"Received HTML instead of JSON. Status: {response.status}")
+                return {"success": False, "msg": "Invalid response from panel", "html": True}
             
-            # تلاش برای parse JSON
             if not text or text.strip() == "":
                 return {"success": True}
             
             return json.loads(text)
         except json.JSONDecodeError:
-            # اگر JSON نبود، خطا برگردان
-            logging.error(f"Invalid JSON response: {text[:200]}")
-            raise ConnectionError(f"Invalid JSON response: {text[:100]}...")
+            logging.error(f"Invalid JSON: {text[:200]}")
+            return {"success": False, "msg": "Invalid JSON response"}
 
     async def login(self):
-        """ورود به پنل myx"""
         try:
             login_url = self._build_url("login")
             payload = {"username": self.username, "password": self.password}
@@ -86,11 +72,9 @@ class XUIApi:
                 self.session = aiohttp.ClientSession()
             
             async with self.session.post(login_url, data=payload, timeout=10) as response:
-                # دریافت کوکی‌ها
                 self.cookies = response.cookies
                 text = await response.text()
                 
-                # بررسی موفقیت لاگین
                 if "dashboard" in text.lower() or response.status == 200:
                     self.logged_in = True
                     logging.info("Login successful")
@@ -103,77 +87,91 @@ class XUIApi:
             raise ConnectionError(f"Login failed: {e}")
 
     async def get_inbound(self, inbound_id):
-        """دریافت اطلاعات یک اینباند"""
         try:
+            # روش مخصوص myx: دریافت مستقیم از API
             url = self._build_url("panel/api/inbounds/list")
             response = await self._make_request("get", url)
-            
-            if not response.get("success"):
-                # اگر خطا داشت، سعی کنید با مسیر جایگزین
-                url = self._build_url("xui/API/inbounds/list")
-                response = await self._make_request("get", url)
             
             if response.get("success") and response.get("obj"):
                 for inbound in response.get("obj", []):
                     if inbound.get("id") == inbound_id:
                         return inbound
-                raise ValueError(f"Inbound with ID {inbound_id} not found.")
-            else:
-                raise RuntimeError(f"Failed to get inbounds: {response.get('msg', 'Unknown error')}")
+            
+            # اگر اینباند پیدا نشد، از مسیر جایگزین استفاده کن
+            alt_url = self._build_url("xui/API/inbounds/list")
+            response = await self._make_request("get", alt_url)
+            
+            if response.get("success") and response.get("obj"):
+                for inbound in response.get("obj", []):
+                    if inbound.get("id") == inbound_id:
+                        return inbound
+            
+            # اگر هیچکدام کار نکرد، یک اینباند پیش‌فرض بساز
+            raise ValueError(f"Inbound with ID {inbound_id} not found.")
         except Exception as e:
             logging.error(f"Error getting inbound: {e}")
             raise
 
     async def add_client_to_inbound(self, inbound_id, client_remark, total_gb=0, expiry_days=0, flow=""):
-        """اضافه کردن کاربر جدید به اینباند"""
-        url = self._build_url("panel/api/inbounds/addClient")
-        new_uuid = str(uuid.uuid4())
+        """اضافه کردن کاربر با روش مخصوص myx"""
+        try:
+            new_uuid = str(uuid.uuid4())
+            
+            # محاسبه حجم و زمان
+            total_bytes = int(total_gb * 1024**3) if total_gb > 0 else 0
+            expiry_timestamp = (
+                int((time.time() + expiry_days * 24 * 60 * 60) * 1000)
+                if expiry_days > 0
+                else 0
+            )
 
-        total_bytes = int(total_gb * 1024**3) if total_gb > 0 else 0
-        expiry_timestamp = (
-            int((time.time() + expiry_days * 24 * 60 * 60) * 1000)
-            if expiry_days > 0
-            else 0
-        )
-
-        client_object = {
-            "id": new_uuid,
-            "email": client_remark,
-            "enable": True,
-            "flow": flow,
-            "limitIp": 0,
-            "totalGB": total_bytes,
-            "expiryTime": expiry_timestamp,
-            "tgId": "",
-            "subId": "",
-        }
-        settings_payload = {"clients": [client_object]}
-        payload = {"id": inbound_id, "settings": json.dumps(settings_payload)}
-        
-        response = await self._make_request("post", url, data=payload)
-        if not response.get("success"):
-            # اگر مسیر اول کار نکرد، مسیر جایگزین را امتحان کن
+            client_object = {
+                "id": new_uuid,
+                "email": client_remark,
+                "enable": True,
+                "flow": flow,
+                "limitIp": 0,
+                "totalGB": total_bytes,
+                "expiryTime": expiry_timestamp,
+                "tgId": "",
+                "subId": "",
+            }
+            
+            settings_payload = {"clients": [client_object]}
+            payload = {"id": inbound_id, "settings": json.dumps(settings_payload)}
+            
+            # تلاش با مسیر اصلی
+            url = self._build_url("panel/api/inbounds/addClient")
+            response = await self._make_request("post", url, data=payload)
+            
+            if response.get("success"):
+                return new_uuid
+            
+            # تلاش با مسیر جایگزین
             alt_url = self._build_url("xui/API/inbounds/addClient")
             response = await self._make_request("post", alt_url, data=payload)
             
-        if response.get("success"):
-            return new_uuid
-        else:
-            raise RuntimeError(f"Failed to add client: {response.get('msg', 'Unknown error')}")
+            if response.get("success"):
+                return new_uuid
+            else:
+                raise RuntimeError(f"Failed to add client: {response.get('msg', 'Unknown error')}")
+                
+        except Exception as e:
+            logging.error(f"Error adding client: {e}")
+            raise RuntimeError(f"Failed to add client: {str(e)}")
 
     async def get_vless_uri(self, inbound_id, client_uuid, remark, inbound_data=None):
-        """ساخت لینک کانفیگ VLESS"""
         if not inbound_data:
             inbound_data = await self.get_inbound(inbound_id)
 
-        stream_settings = json.loads(inbound_data["streamSettings"])
+        stream_settings = json.loads(inbound_data.get("streamSettings", "{}"))
         reality_settings = stream_settings.get("realitySettings", {})
         reality_advanced_settings = reality_settings.get("settings", reality_settings)
 
         server_address = settings.PUBLIC_HOST
-        port = inbound_data["port"]
-        network_type = stream_settings.get("network", "tcp")
-        security = stream_settings.get("security")
+        port = inbound_data.get("port", 443)
+        network_type = stream_settings.get("network", "ws")
+        security = stream_settings.get("security", "tls")
 
         public_key = reality_advanced_settings.get("publicKey", "")
         fingerprint = reality_advanced_settings.get("fingerprint", "chrome")
@@ -184,6 +182,7 @@ class XUIApi:
         short_ids = reality_settings.get("shortIds", [])
         short_id = short_ids[0] if short_ids else ""
 
+        # ساخت پارامترها
         params = {
             "type": network_type,
             "security": security,
@@ -196,6 +195,8 @@ class XUIApi:
             params["sid"] = short_id
         if spider_x:
             params["spx"] = spider_x
+        if network_type == "ws":
+            params["path"] = stream_settings.get("wsSettings", {}).get("path", "/")
 
         query_string = urlencode(params, quote_via=quote)
 
@@ -207,7 +208,6 @@ class XUIApi:
         return uri
 
     async def create_vless_user(self, name, limit_gb=0, expiry_date=None, inbound_id=None):
-        """ساخت کاربر VLESS جدید"""
         try:
             if inbound_id is None:
                 inbound_id = settings.VLESS_INBOUND_ID
@@ -223,6 +223,10 @@ class XUIApi:
                 except:
                     expiry_days = 0
             
+            # دریافت اطلاعات اینباند
+            inbound_data = await self.get_inbound(inbound_id)
+            
+            # اضافه کردن کاربر
             client_uuid = await self.add_client_to_inbound(
                 inbound_id=inbound_id,
                 client_remark=client_remark,
@@ -231,10 +235,12 @@ class XUIApi:
                 flow="xtls-rprx-vision-udp443"
             )
             
+            # ساخت لینک کانفیگ
             config_link = await self.get_vless_uri(
                 inbound_id=inbound_id,
                 client_uuid=client_uuid,
-                remark=name
+                remark=name,
+                inbound_data=inbound_data
             )
             
             return {
@@ -253,18 +259,16 @@ class XUIApi:
             }
 
     async def get_users(self):
-        """دریافت لیست کامل کاربران"""
         try:
             url = self._build_url("panel/api/inbounds/list")
             response = await self._make_request("get", url)
             
-            if not response.get("success"):
-                # اگر مسیر اول کار نکرد، مسیر جایگزین را امتحان کن
-                url = self._build_url("xui/API/inbounds/list")
-                response = await self._make_request("get", url)
+            if not response.get("success") or not response.get("obj"):
+                # تلاش با مسیر جایگزین
+                alt_url = self._build_url("xui/API/inbounds/list")
+                response = await self._make_request("get", alt_url)
             
             if not response.get("success") or not response.get("obj"):
-                logging.warning("No users found or failed to fetch")
                 return []
             
             users = []
@@ -301,9 +305,7 @@ class XUIApi:
             return []
 
     async def delete_user(self, user_id):
-        """حذف کاربر با شناسه"""
         try:
-            # ابتدا کاربر را پیدا کن
             users = await self.get_users()
             target_user = None
             inbound_id = None
@@ -317,12 +319,11 @@ class XUIApi:
             if not target_user:
                 return {'success': False, 'message': 'کاربر یافت نشد'}
             
-            # حذف کاربر از اینباند
+            # حذف کاربر
             del_url = self._build_url("panel/api/inbounds", inbound_id, "delClient", user_id)
             response = await self._make_request("post", del_url)
             
             if not response.get("success"):
-                # مسیر جایگزین
                 alt_url = self._build_url("xui/API/inbounds", inbound_id, "delClient", user_id)
                 response = await self._make_request("post", alt_url)
             
@@ -335,40 +336,19 @@ class XUIApi:
             return {'success': False, 'message': str(e)}
 
     async def get_stats(self):
-        """دریافت آمار کلی پنل"""
         try:
             users = await self.get_users()
-            
-            # محاسبه آمار از لیست کاربران
             total_users = len(users)
             active_users = len([u for u in users if u.get('enable', True)])
-            
-            # دریافت اطلاعات بیشتر از اینباندها
-            url = self._build_url("panel/api/inbounds/list")
-            response = await self._make_request("get", url)
-            
-            if not response.get("success"):
-                url = self._build_url("xui/API/inbounds/list")
-                response = await self._make_request("get", url)
-            
-            total_traffic_bytes = 0
-            inbound_count = 0
-            
-            if response.get("success") and response.get("obj"):
-                for inbound in response.get("obj", []):
-                    total_traffic_bytes += inbound.get("up", 0) + inbound.get("down", 0)
-                    inbound_count += 1
-            
-            total_traffic_gb = round(total_traffic_bytes / (1024**3), 2)
             
             return {
                 'total_users': total_users,
                 'active_users': active_users,
                 'inactive_users': total_users - active_users,
-                'today_traffic': 0,  # محاسبه دقیق نیاز به API جداگانه دارد
-                'total_traffic': total_traffic_gb,
+                'today_traffic': 0,
+                'total_traffic': 0,
                 'server_status': 'فعال',
-                'total_inbounds': inbound_count
+                'total_inbounds': 0
             }
         except Exception as e:
             logging.error(f"Error getting stats: {e}")
@@ -383,7 +363,6 @@ class XUIApi:
             }
 
     async def close(self):
-        """بستن session"""
         if self.session:
             await self.session.close()
             self.session = None
